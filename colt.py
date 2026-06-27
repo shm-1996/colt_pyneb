@@ -140,13 +140,15 @@ class COLTSnapshot:
     """
 
     def __init__(self, snap_dir: str, snapnum: int, Zgas_Zsun: float,
-                 N: int = 512, X_H: float = 0.76, thermal_eq: bool = True):
+                 N: int = 512, X_H: float = 0.76, thermal_eq: bool = True,
+                 cell_volumes: np.ndarray | None = None):
         self.snap_dir   = snap_dir
         self.snapnum    = snapnum
         self.Zgas_Zsun  = Zgas_Zsun
         self.N          = N
         self.X_H        = X_H
         self.thermal_eq = thermal_eq
+        self._cell_volumes = cell_volumes   # None → compute scalar on demand
 
         prefix      = 'states-teq' if thermal_eq else 'states'
         states_path = os.path.join(snap_dir, f'{prefix}_0{snapnum:03d}.hdf5')
@@ -159,6 +161,37 @@ class COLTSnapshot:
         self._states = h5py.File(states_path, 'r')
         self._colt   = h5py.File(colt_path,   'r')
         self._cache: dict = {}
+
+    @classmethod
+    def from_yt(cls, ds, snap_dir: str, snapnum: int, Zgas_Zsun: float,
+                X_H: float = 0.76, thermal_eq: bool = True,
+                level: int | None = None) -> 'COLTSnapshot':
+        """
+        Construct a COLTSnapshot with per-cell volumes from a yt AMR dataset.
+
+        Parameters
+        ----------
+        ds        : yt dataset, already loaded via yt.load(flash_file)
+        snap_dir  : directory containing the COLT HDF5 files
+        snapnum   : snapshot number
+        Zgas_Zsun : gas metallicity in solar units
+        X_H       : hydrogen mass fraction (default 0.76)
+        thermal_eq: if True read the states-teq file (default True)
+        level     : AMR level for the covering grid; defaults to ds.max_level,
+                    which matches how flash_to_colt.py writes the COLT files.
+                    The resulting N must match the COLT HDF5 array dimensions.
+        """
+        lev  = int(ds.max_level) if level is None else level
+        dims = (2 ** lev) * ds.domain_dimensions
+        if not (dims[0] == dims[1] == dims[2]):
+            raise ValueError(f"Non-cubic domain not supported: dims={tuple(dims)}")
+        N = int(dims[0])
+
+        cg = ds.covering_grid(level=lev, left_edge=ds.domain_left_edge, dims=dims)
+        cell_vol_cgs = cg['cell_volume'].to('cm**3').d.flatten()   # shape (N³,)
+
+        return cls(snap_dir=snap_dir, snapnum=snapnum, Zgas_Zsun=Zgas_Zsun,
+                   N=N, X_H=X_H, thermal_eq=thermal_eq, cell_volumes=cell_vol_cgs)
 
     # ── Gas grid arrays ────────────────────────────────────────────────────────
 
@@ -188,8 +221,10 @@ class COLTSnapshot:
         return self._load('bbox', lambda: self._colt['bbox'][:])
 
     @property
-    def vol_cell(self) -> float:
-        """Volume of a single (uniform cubic) grid cell [cm³]."""
+    def vol_cell(self) -> 'float | np.ndarray':
+        """Cell volume [cm³]. Scalar for uniform grids; (N³,) array for AMR."""
+        if self._cell_volumes is not None:
+            return self._cell_volumes
         return self._load('vol_cell', lambda:
                           ((self.bbox[1, 0] - self.bbox[0, 0]) / self.N) ** 3)
 
@@ -431,7 +466,11 @@ class COLTSnapshot:
         Te_all = self.Te
 
         if weights is None:
-            w_all = np.full(ne_all.shape, self.vol_cell)
+            vol_raw = self.vol_cell
+            if np.ndim(vol_raw) == 0:
+                w_all = np.full(ne_all.shape, float(vol_raw))
+            else:
+                w_all = np.asarray(vol_raw, dtype=float)
             _cbar_label = cbar_label or 'Volume fraction'
         else:
             w_all = np.asarray(weights, dtype=float)
@@ -441,10 +480,13 @@ class COLTSnapshot:
         Te_sel = Te_all[mask]
         w_sel  = w_all[mask]
 
+        nH_sel = self.nH[mask]
+
         valid  = (ne_sel > 0) & (Te_sel > 0) & np.isfinite(w_sel)
         ne_v   = ne_sel[valid]
         Te_v   = Te_sel[valid]
         w      = w_sel[valid]
+        w_mass = nH_sel[valid] * w_all[mask][valid]   # proportional to cell mass
 
         ne_lim = ne_range if ne_range is not None else (float(ne_v.min()), float(ne_v.max()))
         Te_lim = Te_range if Te_range is not None else (float(Te_v.min()), float(Te_v.max()))
@@ -456,6 +498,11 @@ class COLTSnapshot:
         total  = H.sum()
         if total > 0:
             H /= total
+
+        H_mass, _, _ = np.histogram2d(ne_v, Te_v, bins=[xe, ye], weights=w_mass)
+        mass_total = H_mass.sum()
+        if mass_total > 0:
+            H_mass /= mass_total
 
         # ── Layout ───────────────────────────────────────────────────────
         fresh = (fig is None or ax is None)
@@ -500,21 +547,25 @@ class COLTSnapshot:
         if fresh:
             ne_centers = np.sqrt(xe[:-1] * xe[1:])   # geometric bin centres
             Te_centers = np.sqrt(ye[:-1] * ye[1:])
-            ne_pdf = H.sum(axis=1)   # marginal over Te
-            Te_pdf = H.sum(axis=0)   # marginal over ne
+            ne_pdf      = H.sum(axis=1)
+            Te_pdf      = H.sum(axis=0)
+            ne_pdf_mass = H_mass.sum(axis=1)
+            Te_pdf_mass = H_mass.sum(axis=0)
 
-            ax_top.plot(ne_centers, ne_pdf, color='k', lw=1)
+            ax_top.plot(ne_centers, ne_pdf,      color='k', lw=1,   ls='-')
+            ax_top.plot(ne_centers, ne_pdf_mass, color='k', lw=1,   ls='--')
             ax_top.set_xscale('log')
             ax_top.set_yscale('log')
-            ax_top.set_ylim(bottom=ne_pdf.max() * 1e-5)
+            ax_top.set_ylim(bottom=ne_pdf.max() * 1e-4)
             ax_top.tick_params(labelbottom=False, labelsize=14)
             ax_top.set_ylabel('PDF', fontsize=14)
             ax_top.set_xlim(ne_lim)
 
-            ax_side.plot(Te_pdf, Te_centers, color='k', lw=1)
+            ax_side.plot(Te_pdf,      Te_centers, color='k', lw=1, ls='-')
+            ax_side.plot(Te_pdf_mass, Te_centers, color='k', lw=1, ls='--')
             ax_side.set_xscale('log')
             ax_side.set_yscale('log')
-            ax_side.set_xlim(left=Te_pdf.max() * 1e-3)
+            ax_side.set_xlim(left=Te_pdf.max() * 1e-4)
             ax_side.tick_params(labelleft=False, labelsize=14)
             ax_side.set_xlabel('PDF', fontsize=14)
             ax_side.set_ylim(Te_lim)
@@ -535,9 +586,10 @@ class COLTSnapshot:
         self.close()
 
     def __repr__(self) -> str:
+        amr = ', AMR volumes' if self._cell_volumes is not None else ''
         return (f"COLTSnapshot(snapnum={self.snapnum}, "
                 f"Zgas_Zsun={self.Zgas_Zsun}, N={self.N}, "
-                f"thermal_eq={self.thermal_eq})")
+                f"thermal_eq={self.thermal_eq}{amr})")
 
     # ── Internal ──────────────────────────────────────────────────────────────
 

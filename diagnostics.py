@@ -149,13 +149,14 @@ class Diagnostics:
         Emission-measure–weighted mean temperature T0 and Peimbert's t² for a
         line-emitting region.
 
-            w_i = n_{e,i} × n_{ion,i}          (emission-measure weight)
+            w_i = n_{e,i} × n_{ion,i} × V_{cell,i}   (emission-measure weight)
             T0  = Σ_i w_i T_i / Σ_i w_i
             t²  = Σ_i w_i (T_i − T0)² / (T0² Σ_i w_i)
 
         The ion species is taken from the weight_line's ion_key in LINE_LIBRARY
-        (e.g. 'OIII_4363' → n_OIII, 'NII_5755' → n_NII).  Cell volume cancels
-        for a uniform grid and is not included in the weight.
+        (e.g. 'OIII_4363' → n_OIII, 'NII_5755' → n_NII).  For a uniform grid
+        V_cell is constant and cancels; for AMR it is required and is read from
+        grid.vol (scalar or per-cell array).
 
         Parameters
         ----------
@@ -177,7 +178,7 @@ class Diagnostics:
         Te    = grid.Te
         ne    = grid.ne
         n_ion = grid.ions[ion_key]
-        w     = ne * n_ion   # emission-measure weight; uniform V cancels
+        w     = ne * n_ion * grid.vol   # EM weight; scalar vol cancels for uniform grid
 
         if mask is not None:
             mask = np.asarray(mask)
